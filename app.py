@@ -308,8 +308,18 @@ with tab1:
                         st.error("No matches found. Filters are too strict!")
                     else:
                         st.success(f"Found {len(cands)} matches!")
-                        buffer = generate_advanced_excel_buffer(ref, cands, constants, variants)
-                        st.download_button("📥 Download Excel", data=buffer, file_name=f"Comparison_{ref['Part Number']}.xlsx")
+                        # Save the generated excel file to the session state
+                        st.session_state['excel_buffer'] = generate_advanced_excel_buffer(ref, cands, constants, variants)
+                        st.session_state['excel_filename'] = f"Comparison_{ref['Part Number']}.xlsx"
+                        
+        # OUTSIDE THE FORM: If the buffer exists, show the download button!
+        if 'excel_buffer' in st.session_state:
+            st.download_button(
+                label="📥 Download Excel", 
+                data=st.session_state['excel_buffer'], 
+                file_name=st.session_state['excel_filename'],
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
 
 # --- TAB 2: BATCH EXTRACT ---
 with tab2:
