@@ -34,7 +34,6 @@ SPEC_ALIASES = {
     "sound level": ["sound pressure level", "spl", "db"]
 }
 
-@st.cache_data(ttl=3600)
 def get_digikey_token():
     url = "https://api.digikey.com/v1/oauth2/token"
     payload = {'grant_type': 'client_credentials', 'client_id': CLIENT_ID, 'client_secret': CLIENT_SECRET}
@@ -84,10 +83,17 @@ def auto_extract_specs_from_pdf(pdf_url):
     except Exception: return {}
 
 def fetch_part_data(token, part_number):
+    # Clean up accidental spaces!
+    part_number = part_number.strip()
+    
     url = "https://api.digikey.com/products/v4/search/keyword"
     headers = {"Authorization": f"Bearer {token}", "X-DIGIKEY-Client-Id": CLIENT_ID, "Content-Type": "application/json"}
     response = requests.post(url, json={"Keywords": part_number, "Limit": 1}, headers=headers)
-    if response.status_code != 200 or not response.json().get('Products'): return None 
+    
+    if response.status_code != 200: 
+        raise Exception(f"DigiKey API Error {response.status_code}: {response.text}")
+    if not response.json().get('Products'): 
+        return None
     
     prod = response.json()['Products'][0]
     datasheet_url = prod.get('DatasheetUrl')
@@ -269,7 +275,7 @@ tab1, tab2 = st.tabs(["Find Alternatives", "Batch Extract Characteristics"])
 # --- TAB 1: FIND ALTERNATIVES ---
 with tab1:
     st.markdown("Find alternative components based on strict rules.")
-    ref_part_num = st.text_input("Enter Reference Part Number:", key="ref_input")
+    ref_part_num = st.text_input("Enter Reference Part Number:", key="ref_input").strip()
     
     if st.button("Lookup Part", type="primary"):
         if ref_part_num:
