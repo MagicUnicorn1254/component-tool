@@ -34,6 +34,16 @@ CORE_PDF_TARGETS = {
     "sound level": ["sound pressure level", "spl", "db"]
 }
 
+@st.cache_data(ttl=86400) # Caches the exchange rate for 24 hours
+def get_usd_to_cad_rate():
+    """Pings the live global exchange market for today's USD to CAD rate!"""
+    try:
+        url = "https://open.er-api.com/v6/latest/USD"
+        response = requests.get(url, timeout=3)
+        return float(response.json()['rates']['CAD'])
+    except Exception:
+        return 1.36 # Safe fallback if the internet hiccups
+
 def get_digikey_token():
     url = "https://api.digikey.com/v1/oauth2/token"
     payload = {'grant_type': 'client_credentials', 'client_id': CLIENT_ID, 'client_secret': CLIENT_SECRET}
@@ -129,7 +139,7 @@ def fetch_part_data(token, part_number):
         "Authorization": f"Bearer {token}", 
         "X-DIGIKEY-Client-Id": CLIENT_ID, 
         "Content-Type": "application/json",
-        "X-DIGIKEY-Locale-Site": "US",
+        "X-DIGIKEY-Locale-Site": "US", # Set to US to grab base prices
         "X-DIGIKEY-Locale-Currency": "CAD"
     }
     
@@ -148,13 +158,20 @@ def fetch_part_data(token, part_number):
     if not prod:
         raise Exception(f"Product '{part_number}' does not exist. Please check your part number.")
 
+    # --- THE SMART CURRENCY CONVERTER ---
+    raw_price = extract_price(prod)
+    is_usd = (headers.get("X-DIGIKEY-Locale-Site") == "US")
+    cad_exchange_rate = get_usd_to_cad_rate() if is_usd else 1.0
+    final_cad_price = raw_price * cad_exchange_rate
+    # ------------------------------------
+
     datasheet_url = prod.get('DatasheetUrl')
 
     part_profile = {
         "Part Number": prod.get('ManufacturerProductNumber') or prod.get('ProductCode') or part_number,
         "Manufacturer": prod.get('Manufacturer', {}).get('Name'),
         "Description": prod.get('ProductDescription') or "",
-        "Price": extract_price(prod),
+        "Price": final_cad_price,
         "DatasheetUrl": datasheet_url,
         "ProductUrl": prod.get('ProductUrl', '').replace('.com', '.ca')
     }
@@ -177,7 +194,7 @@ def find_similar_parts(token, search_keyword, constants_dict, variables_list):
         "Authorization": f"Bearer {token}", 
         "X-DIGIKEY-Client-Id": CLIENT_ID, 
         "Content-Type": "application/json",
-        "X-DIGIKEY-Locale-Site": "US",
+        "X-DIGIKEY-Locale-Site": "US", # Set to US to grab base prices
         "X-DIGIKEY-Locale-Currency": "CAD"
     }
     response = requests.post(url, json={"Keywords": search_keyword, "Limit": 50}, headers=headers)
@@ -187,15 +204,20 @@ def find_similar_parts(token, search_keyword, constants_dict, variables_list):
         return None
         
     products = response.json().get('Products', [])
-    if not products: 
+    if not products:
         st.error(f"DigiKey returned 0 parts when searching for '{search_keyword}'. Check for typos!")
         return []
+
+    # Get the exchange rate once to save time
+    is_usd = (headers.get("X-DIGIKEY-Locale-Site") == "US")
+    cad_exchange_rate = get_usd_to_cad_rate() if is_usd else 1.0
 
     matching_candidates = []
     for prod in products:
         cand_params = {p.get('ParameterText', '').strip().lower(): p.get('ValueText', '').strip() for p in prod.get('Parameters', []) if p.get('ParameterText')}
         split_temperature_ranges(cand_params)
         datasheet_url = prod.get('DatasheetUrl')
+        pdf_scanned, match_failed = False, False
 
         keys_to_check = list(constants_dict.keys()) + variables_list
         is_missing_data = any(k not in cand_params or cand_params[k] == "-" for k in keys_to_check)
@@ -206,7 +228,6 @@ def find_similar_parts(token, search_keyword, constants_dict, variables_list):
                 if k not in cand_params or cand_params[k] == "-": 
                     cand_params[k] = v
 
-        match_failed = False
         for c_param, required_val in constants_dict.items():
             cand_val = cand_params.get(c_param)
             if not cand_val: match_failed = True; break
@@ -233,10 +254,14 @@ def find_similar_parts(token, search_keyword, constants_dict, variables_list):
 
         if match_failed: continue
 
+        # --- APPLY THE SMART EXCHANGE RATE ---
+        raw_price = extract_price(prod)
+        final_cad_price = raw_price * cad_exchange_rate
+
         matching_candidates.append({
             "Part Number": prod.get('ManufacturerProductNumber') or prod.get('ProductCode'),
             "Manufacturer": prod.get('Manufacturer', {}).get('Name'),
-            "Price": extract_price(prod),
+            "Price": final_cad_price,
             "DatasheetUrl": datasheet_url,
             "ProductUrl": prod.get('ProductUrl', '').replace('.com', '.ca'),
             "all_params": cand_params  
@@ -264,7 +289,7 @@ def generate_advanced_excel_buffer(ref_part, candidates, constants, variables):
         ws.cell(row=1, column=3+len(constants), value="Varying Aspects").alignment = center_align
         ws.merge_cells(start_row=1, start_column=3+len(constants), end_row=1, end_column=3+len(constants)+len(variables)-1)
     
-    ws.cell(row=1, column=price_col, value="Price 100-Qty (USD)").alignment = center_align
+    ws.cell(row=1, column=price_col, value="Price 100-Qty (CAD)").alignment = center_align
     ws.merge_cells(start_row=1, start_column=price_col, end_row=2, end_column=price_col)
 
     ws.cell(row=1, column=link_col, value="DigiKey Link").alignment = center_align
@@ -336,7 +361,7 @@ def generate_batch_extract_excel_buffer(part_profiles, all_params):
 
     ws.cell(row=1, column=1, value="Part Number").font = bold_font
     ws.cell(row=1, column=2, value="Manufacturer").font = bold_font
-    ws.cell(row=1, column=3, value="Price 100-Qty (USD)").font = bold_font
+    ws.cell(row=1, column=3, value="Price 100-Qty (CAD)").font = bold_font
     ws.cell(row=1, column=4, value="DigiKey Link").font = bold_font
     
     col = 5
@@ -370,7 +395,7 @@ def generate_batch_extract_excel_buffer(part_profiles, all_params):
     ws.column_dimensions['D'].width = 20
     for col_idx in range(5, 5 + len(all_params)):
         ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = 20
-        
+
     buffer = io.BytesIO()
     wb.save(buffer)
     buffer.seek(0)
@@ -412,7 +437,6 @@ with tab1:
         
         keys = [k for k in ref.keys() if k not in ["Part Number", "Manufacturer", "Description", "Price", "DatasheetUrl", "ProductUrl", "Category"]]
         
-        # Format the dropdown options so they show "voltage (3.3V)" instead of just "voltage"
         def format_dropdown(key_name):
             return f"{key_name}: {ref.get(key_name, 'N/A')}"
             
@@ -421,7 +445,6 @@ with tab1:
         
         search_cat = st.text_input("Search Keyword (DigiKey shorthand):", value=smart_sugg)
         
-        # THESE ARE THE NEW BEAUTIFUL DROPDOWNS!
         constants = st.multiselect("What MUST remain exactly the same?", options=keys, format_func=format_dropdown)
         
         for c in constants:
@@ -440,7 +463,7 @@ with tab1:
                     cands = find_similar_parts(token, search_cat, target_consts, variants)
                     
                     if cands is None:
-                        pass # Error already printed in the function
+                        pass 
                     elif not cands:
                         st.error("No matches found. Filters are too strict!")
                     else:
