@@ -336,7 +336,7 @@ def generate_batch_extract_excel_buffer(part_profiles, all_params):
 
     ws.cell(row=1, column=1, value="Part Number").font = bold_font
     ws.cell(row=1, column=2, value="Manufacturer").font = bold_font
-    ws.cell(row=1, column=3, value="Price 100-Qty (CAD)").font = bold_font
+    ws.cell(row=1, column=3, value="Price 100-Qty (USD)").font = bold_font
     ws.cell(row=1, column=4, value="DigiKey Link").font = bold_font
     
     col = 5
