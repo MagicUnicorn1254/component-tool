@@ -7,16 +7,14 @@ from pypdf import PdfReader
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment
 
-# Mute pypdf's annoying warning messages
 logging.getLogger("pypdf").setLevel(logging.CRITICAL)
 
-st.set_page_config(page_title="Component Engine", page_icon="⚡", layout="wide")
+st.set_page_config(page_title="Component Engine", layout="wide")
 
-# DigiKey Production Client Credentials
 CLIENT_ID = '295EGpEwJEuPCaTsslUztQdBUXQOCLvGztU2UlEkqGfcIyur'
 CLIENT_SECRET = 'X80tbzNKh50mx6IieAOoJcWl57jhE3dmiycn2jYj74XTVZisrUGyJHKumFiB1wDr'
 
-SPEC_ALIASES = {
+CORE_PDF_TARGETS = {
     "power": ["power dissipation", "power consumption", "p_diss", "max. power", "power"],
     "voltage": ["supply voltage", "voltage - supply", "operating voltage", "rated voltage", "voltage"],
     "current": ["continuous drain current", "drain current", "id", "supply current", "operating current", "current"],
@@ -36,7 +34,6 @@ SPEC_ALIASES = {
     "sound level": ["sound pressure level", "spl", "db"]
 }
 
-# (Token is intentionally not cached so we don't accidentally send expired tokens)
 def get_digikey_token():
     url = "https://api.digikey.com/v1/oauth2/token"
     payload = {'grant_type': 'client_credentials', 'client_id': CLIENT_ID, 'client_secret': CLIENT_SECRET}
@@ -48,32 +45,32 @@ def get_digikey_token():
     return response.json()['access_token']
 
 def extract_price(prod_dict):
-    """Safely extracts the price for a Quantity of 1, checking variations if needed."""
     try:
-        # First, try to find the standard pricing directly
-        pricing_list = []
+        best_unit_price = float('inf')
         variations = prod_dict.get('ProductVariations', [])
-        
-        if variations:
-            # We'll check the first variation (usually Cut Tape or standard)
-            pricing_list = variations[0].get('StandardPricing', [])
-        else:
-            pricing_list = prod_dict.get('StandardPricing', [])
+        if not variations:
+            variations = [{'StandardPricing': prod_dict.get('StandardPricing', [])}]
             
-        # Loop through the price breaks and find the one where you only have to buy 1
-        for price_break in pricing_list:
-            if price_break.get('BreakQuantity', 0) == 1:
-                return price_break.get('UnitPrice', 0.0)
+        for var in variations:
+            pricing_list = var.get('StandardPricing', [])
+            if not pricing_list: continue
                 
-        # Fallback: If no "Quantity 1" is found, just return the highest price 
-        # (which is usually the lowest quantity price block)
-        if pricing_list:
-            highest_price = max([p.get('UnitPrice', 0.0) for p in pricing_list])
-            return highest_price
-
+            sorted_breaks = sorted(pricing_list, key=lambda x: x.get('BreakQuantity', 0))
+            if sorted_breaks[0].get('BreakQuantity', 0) > 100:
+                continue
+                
+            current_var_price = float('inf')
+            for price_break in sorted_breaks:
+                if price_break.get('BreakQuantity', 0) <= 100:
+                    current_var_price = price_break.get('UnitPrice', 0.0)
+                    
+            if 0.0 < current_var_price < best_unit_price:
+                best_unit_price = current_var_price
+                
+        if best_unit_price != float('inf'):
+            return best_unit_price * 100 
     except Exception: 
         pass
-    
     return 0.0
 
 def split_temperature_ranges(part_dict):
@@ -85,88 +82,113 @@ def split_temperature_ranges(part_dict):
                 part_dict['max temperature'] = match.group(2) + "°C"
             break
 
-def auto_extract_specs_from_pdf(pdf_url):
+def auto_extract_specs_from_pdf(pdf_url, expected_keys):
     if not pdf_url: return {}
     if pdf_url.startswith("//"): pdf_url = "https:" + pdf_url
     try:
         headers = {'User-Agent': 'Mozilla/5.0'}
         response = requests.get(pdf_url, headers=headers, timeout=5)
         if response.status_code != 200: return {}
+        
         reader = PdfReader(io.BytesIO(response.content))
         max_pages = min(3, len(reader.pages))
         full_text = "".join(reader.pages[i].extract_text() or "" for i in range(max_pages))
+        
         extracted_params = {}
-        for category, aliases in SPEC_ALIASES.items():
+        for category, aliases in CORE_PDF_TARGETS.items():
             pattern = re.compile(rf"({'|'.join(sorted(aliases, key=len, reverse=True))})[^\d]*([0-9\.\-\~]+\s*[a-zA-Z]*)", re.IGNORECASE)
             match = pattern.search(full_text)
             if match: extracted_params[category] = match.group(2).split('\n')[0].strip()
+
+        for key in expected_keys:
+            if key in extracted_params: continue
+            search_terms = [key]
+            acronyms = re.findall(r'\(([^)]+)\)', key)
+            search_terms.extend(acronyms)
+            if "-" in key:
+                search_terms.append(key.split("-")[0].strip())
+            search_terms = [re.escape(t) for t in search_terms if len(t) > 1]
+            if not search_terms: continue
+                
+            pattern_str = '|'.join(sorted(search_terms, key=len, reverse=True))
+            pattern = re.compile(rf"({pattern_str})[^\d]*([0-9\.\-\~]+\s*[a-zA-Z]*)", re.IGNORECASE)
+            
+            match = pattern.search(full_text)
+            if match: 
+                extracted_params[key] = match.group(2).split('\n')[0].strip()
+                
         split_temperature_ranges(extracted_params)
         return extracted_params
-    except Exception: return {}
+    except Exception: 
+        return {}
 
 def fetch_part_data(token, part_number):
     part_number = part_number.strip()
     url = "https://api.digikey.com/products/v4/search/keyword"
-    headers = {"Authorization": f"Bearer {token}", "X-DIGIKEY-Client-Id": CLIENT_ID, "Content-Type": "application/json"}
-    response = requests.post(url, json={"Keywords": part_number, "Limit": 1}, headers=headers)
+    headers = {
+        "Authorization": f"Bearer {token}", 
+        "X-DIGIKEY-Client-Id": CLIENT_ID, 
+        "Content-Type": "application/json",
+        "X-DIGIKEY-Locale-Site": "US",
+        "X-DIGIKEY-Locale-Currency": "CAD"
+    }
     
-    if response.status_code != 200: 
-        raise Exception(f"DigiKey API Error {response.status_code}: {response.text}")
-    if not response.json().get('Products'):
-        raise Exception(f"No products found for {part_number}")
+    response = requests.post(url, json={"Keywords": part_number, "Limit": 10}, headers=headers)
+    if response.status_code != 200 or not response.json().get('Products'):
+        return None 
 
-    prod = response.json()['Products'][0]
-    
-    # Strict Match Guard
-    actual_part_number = prod.get('ManufacturerProductNumber') or prod.get('ProductCode') or ""
-    if not actual_part_number.lower().startswith(part_number.lower()):
+    products = response.json()['Products']
+    prod = None
+    for p in products:
+        actual_part_number = p.get('ManufacturerProductNumber') or p.get('ProductCode') or ""
+        if actual_part_number.lower().startswith(part_number.lower()):
+            prod = p
+            break
+            
+    if not prod:
         raise Exception(f"Product '{part_number}' does not exist. Please check your part number.")
 
     datasheet_url = prod.get('DatasheetUrl')
 
     part_profile = {
-        "Part Number": actual_part_number,
+        "Part Number": prod.get('ManufacturerProductNumber') or prod.get('ProductCode') or part_number,
         "Manufacturer": prod.get('Manufacturer', {}).get('Name'),
         "Description": prod.get('ProductDescription') or "",
         "Price": extract_price(prod),
-        "DatasheetUrl": datasheet_url
+        "DatasheetUrl": datasheet_url,
+        "ProductUrl": prod.get('ProductUrl', '').replace('.com', '.ca')
     }
 
     for param in prod.get('Parameters', []):
         name = param.get('ParameterText', '').strip().lower()
         if name: part_profile[name] = param.get('ValueText', '').strip()
 
-    split_temperature_ranges(part_profile)
-
     if datasheet_url:
-        pdf_specs = auto_extract_specs_from_pdf(datasheet_url)
+        pdf_specs = auto_extract_specs_from_pdf(datasheet_url, list(part_profile.keys()))
         for k, v in pdf_specs.items():
             if k not in part_profile: part_profile[k] = v
 
+    split_temperature_ranges(part_profile)
     return part_profile
-
-def map_parameter_name(user_term, available_keys):
-    user_term = user_term.lower().strip()
-    if user_term in available_keys: return user_term
-    for alias in SPEC_ALIASES.get(user_term, [user_term]):
-        for key in available_keys:
-            if alias in key: return key
-    for key in available_keys:
-        if user_term in key: return key
-    return None
 
 def find_similar_parts(token, search_keyword, constants_dict, variables_list):
     url = "https://api.digikey.com/products/v4/search/keyword"
-    headers = {"Authorization": f"Bearer {token}", "X-DIGIKEY-Client-Id": CLIENT_ID, "Content-Type": "application/json"}
+    headers = {
+        "Authorization": f"Bearer {token}", 
+        "X-DIGIKEY-Client-Id": CLIENT_ID, 
+        "Content-Type": "application/json",
+        "X-DIGIKEY-Locale-Site": "US",
+        "X-DIGIKEY-Locale-Currency": "CAD"
+    }
     response = requests.post(url, json={"Keywords": search_keyword, "Limit": 50}, headers=headers)
     
     if response.status_code != 200: 
-        st.error(f"DigiKey rejected the search. Status: {response.status_code}")
-        return []
+        st.error(f"DigiKey API Error {response.status_code}: {response.text}")
+        return None
         
     products = response.json().get('Products', [])
-    if not products:
-        st.error(f"DigiKey returned 0 parts when we searched for '{search_keyword}'. Try using shorter keywords.")
+    if not products: 
+        st.error(f"DigiKey returned 0 parts when searching for '{search_keyword}'. Check for typos!")
         return []
 
     matching_candidates = []
@@ -174,26 +196,39 @@ def find_similar_parts(token, search_keyword, constants_dict, variables_list):
         cand_params = {p.get('ParameterText', '').strip().lower(): p.get('ValueText', '').strip() for p in prod.get('Parameters', []) if p.get('ParameterText')}
         split_temperature_ranges(cand_params)
         datasheet_url = prod.get('DatasheetUrl')
-        pdf_scanned, match_failed = False, False
 
         keys_to_check = list(constants_dict.keys()) + variables_list
-        if datasheet_url and any(k not in cand_params for k in keys_to_check):
-            pdf_data = auto_extract_specs_from_pdf(datasheet_url)
+        is_missing_data = any(k not in cand_params or cand_params[k] == "-" for k in keys_to_check)
+        
+        if datasheet_url and is_missing_data:
+            pdf_data = auto_extract_specs_from_pdf(datasheet_url, keys_to_check)
             for k, v in pdf_data.items():
-                if k not in cand_params: cand_params[k] = v
+                if k not in cand_params or cand_params[k] == "-": 
+                    cand_params[k] = v
 
+        match_failed = False
         for c_param, required_val in constants_dict.items():
             cand_val = cand_params.get(c_param)
             if not cand_val: match_failed = True; break
             
             req_str, cand_str = str(required_val).lower(), str(cand_val).lower()
-            if req_str in cand_str or cand_str in req_str: continue
+            
+            req_chunks = [x.strip() for x in req_str.replace('/', ',').split(',') if x.strip()]
+            cand_chunks = [x.strip() for x in cand_str.replace('/', ',').split(',') if x.strip()]
+            
+            chunk_match = False
+            for rc in req_chunks:
+                for cc in cand_chunks:
+                    if rc in cc or cc in rc:
+                        chunk_match = True
+                        break
+                if chunk_match: break
                 
+            if chunk_match: continue
+            
             req_nums = "".join(c for c in req_str if c.isdigit() or c == '.')
             cand_nums = "".join(c for c in cand_str if c.isdigit() or c == '.')
-            
             if req_nums and cand_nums and (req_nums in cand_nums or cand_nums in req_nums): continue
-                
             match_failed = True; break
 
         if match_failed: continue
@@ -203,61 +238,89 @@ def find_similar_parts(token, search_keyword, constants_dict, variables_list):
             "Manufacturer": prod.get('Manufacturer', {}).get('Name'),
             "Price": extract_price(prod),
             "DatasheetUrl": datasheet_url,
+            "ProductUrl": prod.get('ProductUrl', '').replace('.com', '.ca'),
             "all_params": cand_params  
         })
-
     return matching_candidates
 
 def generate_advanced_excel_buffer(ref_part, candidates, constants, variables):
     wb = Workbook()
     ws = wb.active
     center_align = Alignment(horizontal='center', vertical='center')
-    price_col = 1 + len(constants) + len(variables) + 1 
+    price_col = 3 + len(constants) + len(variables) 
+    link_col = price_col + 1
 
     ws.cell(row=1, column=1, value="Name / Part Number").alignment = center_align
     ws.merge_cells(start_row=1, start_column=1, end_row=2, end_column=1)
+
+    ws.cell(row=1, column=2, value="Manufacturer").alignment = center_align
+    ws.merge_cells(start_row=1, start_column=2, end_row=2, end_column=2)
     
     if constants:
-        ws.cell(row=1, column=2, value="Constant Aspects").alignment = center_align
-        ws.merge_cells(start_row=1, start_column=2, end_row=1, end_column=1+len(constants))
-    if variables:
-        ws.cell(row=1, column=2+len(constants), value="Varying Aspects").alignment = center_align
-        ws.merge_cells(start_row=1, start_column=2+len(constants), end_row=1, end_column=1+len(constants)+len(variables))
+        ws.cell(row=1, column=3, value="Constant Aspects").alignment = center_align
+        ws.merge_cells(start_row=1, start_column=3, end_row=1, end_column=3+len(constants)-1)
         
-    ws.cell(row=1, column=price_col, value="Price (USD)").alignment = center_align
+    if variables:
+        ws.cell(row=1, column=3+len(constants), value="Varying Aspects").alignment = center_align
+        ws.merge_cells(start_row=1, start_column=3+len(constants), end_row=1, end_column=3+len(constants)+len(variables)-1)
+    
+    ws.cell(row=1, column=price_col, value="Price 100-Qty (CAD)").alignment = center_align
     ws.merge_cells(start_row=1, start_column=price_col, end_row=2, end_column=price_col)
 
-    col = 2
+    ws.cell(row=1, column=link_col, value="DigiKey Link").alignment = center_align
+    ws.merge_cells(start_row=1, start_column=link_col, end_row=2, end_column=link_col)
+
+    col = 3
     for c in constants + variables:
         ws.cell(row=2, column=col, value=str(c))
         col += 1
 
     ws.cell(row=3, column=1, value=f"ORIGINAL: {ref_part['Part Number']}")
-    col = 2
+    ws.cell(row=3, column=2, value=str(ref_part.get('Manufacturer', 'N/A')))
+    col = 3
     for c in constants + variables:
         ws.cell(row=3, column=col, value=str(ref_part.get(c, 'N/A')))
         col += 1
-        
+    
     ws.cell(row=3, column=price_col, value=round(float(ref_part.get('Price', 0.0)), 2))
-    ws.cell(row=3, column=price_col).number_format = '0.00'
+    ws.cell(row=3, column=price_col).number_format = '$0.00'
+    
+    url = ref_part.get('ProductUrl') or ref_part.get('DatasheetUrl')
+    if url:
+        ws.cell(row=3, column=link_col, value="View on DigiKey")
+        ws.cell(row=3, column=link_col).hyperlink = url
+        ws.cell(row=3, column=link_col).font = Font(color="0000FF", underline="single")
+    else:
+        ws.cell(row=3, column=link_col, value="N/A")
 
     current_row = 4
     for cand in candidates:
         ws.cell(row=current_row, column=1, value=str(cand['Part Number']))
-        col = 2
+        ws.cell(row=current_row, column=2, value=str(cand.get('Manufacturer', 'N/A')))
+        col = 3
         for c in constants + variables:
             val = cand['all_params'].get(c, 'N/A')
             ws.cell(row=current_row, column=col, value=str(val))
             if str(val) != str(ref_part.get(c, 'N/A')):
                 ws.cell(row=current_row, column=col).font = Font(underline="single")
             col += 1
-        
+            
         ws.cell(row=current_row, column=price_col, value=round(float(cand.get('Price', 0.0)), 2))
-        ws.cell(row=current_row, column=price_col).number_format = '0.00'
+        ws.cell(row=current_row, column=price_col).number_format = '$0.00'
+
+        if cand.get('ProductUrl'):
+            ws.cell(row=current_row, column=link_col, value="View on DigiKey")
+            ws.cell(row=current_row, column=link_col).hyperlink = cand.get('ProductUrl')
+            ws.cell(row=current_row, column=link_col).font = Font(color="0000FF", underline="single")
+        else:
+            ws.cell(row=current_row, column=link_col, value="N/A")
+            
         current_row += 1
 
-    ws.column_dimensions['A'].width = 40
-    for col_idx in range(2, price_col + 1):
+    ws.column_dimensions['A'].width = 30
+    ws.column_dimensions['B'].width = 25
+    ws.column_dimensions[ws.cell(row=3, column=link_col).column_letter].width = 18
+    for col_idx in range(3, price_col + 1):
         ws.column_dimensions[ws.cell(row=3, column=col_idx).column_letter].width = 20
         
     buffer = io.BytesIO()
@@ -273,9 +336,10 @@ def generate_batch_extract_excel_buffer(part_profiles, all_params):
 
     ws.cell(row=1, column=1, value="Part Number").font = bold_font
     ws.cell(row=1, column=2, value="Manufacturer").font = bold_font
-    ws.cell(row=1, column=3, value="Price (USD)").font = bold_font
+    ws.cell(row=1, column=3, value="Price 100-Qty (CAD)").font = bold_font
+    ws.cell(row=1, column=4, value="DigiKey Link").font = bold_font
     
-    col = 4
+    col = 5
     for param in all_params:
         ws.cell(row=1, column=col, value=str(param)).font = bold_font
         col += 1
@@ -285,9 +349,16 @@ def generate_batch_extract_excel_buffer(part_profiles, all_params):
         ws.cell(row=current_row, column=1, value=str(profile.get('Part Number', 'N/A')))
         ws.cell(row=current_row, column=2, value=str(profile.get('Manufacturer', 'N/A')))
         ws.cell(row=current_row, column=3, value=round(float(profile.get('Price', 0.0)), 2))
-        ws.cell(row=current_row, column=3).number_format = '0.00'
+        ws.cell(row=current_row, column=3).number_format = '$0.00'
 
-        col = 4
+        if profile.get('ProductUrl'):
+            ws.cell(row=current_row, column=4, value="View on DigiKey")
+            ws.cell(row=current_row, column=4).hyperlink = profile.get('ProductUrl')
+            ws.cell(row=current_row, column=4).font = Font(color="0000FF", underline="single")
+        else:
+            ws.cell(row=current_row, column=4, value="N/A")
+
+        col = 5
         for param in all_params:
             ws.cell(row=current_row, column=col, value=str(profile.get(param, 'N/A')))
             col += 1
@@ -295,20 +366,22 @@ def generate_batch_extract_excel_buffer(part_profiles, all_params):
 
     ws.column_dimensions['A'].width = 25
     ws.column_dimensions['B'].width = 20
-    ws.column_dimensions['C'].width = 15
-    for col_idx in range(4, 4 + len(all_params)):
+    ws.column_dimensions['C'].width = 20
+    ws.column_dimensions['D'].width = 20
+    for col_idx in range(5, 5 + len(all_params)):
         ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = 20
-
+        
     buffer = io.BytesIO()
     wb.save(buffer)
     buffer.seek(0)
     return buffer
 
-
 # ==========================================
 # STREAMLIT UI
 # ==========================================
-st.title("⚡ Component Optimization & Extraction Engine")
+st.title("Component Optimization Engine")
+st.markdown("Easily find alternative electronic components and generate comparison spreadsheets.")
+
 token = get_digikey_token()
 
 if not token:
@@ -319,7 +392,7 @@ tab1, tab2 = st.tabs(["Find Alternatives", "Batch Extract Characteristics"])
 # --- TAB 1: FIND ALTERNATIVES ---
 with tab1:
     st.markdown("Find alternative components based on strict rules.")
-    ref_part_num = st.text_input("Enter Reference Part Number:", key="ref_input").strip()
+    ref_part_num = st.text_input("Enter Reference Part Number:", key="ref_input")
     
     if st.button("Lookup Part", type="primary"):
         if ref_part_num:
@@ -328,57 +401,66 @@ with tab1:
                     profile = fetch_part_data(token, ref_part_num)
                     if profile:
                         st.session_state['ref_profile'] = profile
+                    else:
+                        st.error("Part not found on DigiKey.")
                 except Exception as e:
                     st.error(str(e))
                     
     if 'ref_profile' in st.session_state:
         ref = st.session_state['ref_profile']
-        st.success(f"**Loaded:** {ref['Part Number']} ({ref['Manufacturer']}) - ${round(float(ref['Price']), 2)}")
+        st.success(f"Loaded: {ref['Part Number']} ({ref['Manufacturer']}) - ${round(float(ref['Price']), 2)} CAD")
         
-        keys = [k for k in ref.keys() if k not in ["Part Number", "Manufacturer", "Description", "Price", "DatasheetUrl", "Category"]]
-        with st.expander("View Available Parameters"):
-            st.write(", ".join(keys))
+        keys = [k for k in ref.keys() if k not in ["Part Number", "Manufacturer", "Description", "Price", "DatasheetUrl", "ProductUrl", "Category"]]
+        
+        # Format the dropdown options so they show "voltage (3.3V)" instead of just "voltage"
+        def format_dropdown(key_name):
+            return f"{key_name}: {ref.get(key_name, 'N/A')}"
             
         desc = str(ref.get("Description", ""))
         smart_sugg = " ".join(desc.split()[:2]) if desc else ""
         
-        with st.form("compare_form"):
-            search_cat = st.text_input("Search Keyword (DigiKey shorthand):", value=smart_sugg)
-            constants_input = st.text_input("MUST remain the same (comma-separated):")
-            variants_input = st.text_input("Can vary (comma-separated):")
+        search_cat = st.text_input("Search Keyword (DigiKey shorthand):", value=smart_sugg)
+        
+        # THESE ARE THE NEW BEAUTIFUL DROPDOWNS!
+        constants = st.multiselect("What MUST remain exactly the same?", options=keys, format_func=format_dropdown)
+        
+        for c in constants:
+            val = str(ref.get(c, ""))
+            if "~" in val or " to " in val.lower():
+                st.warning(f"HEADS UP: You set '{c}' as a constant, but its value is a range ({val}). Try moving it to the 'can vary' list to avoid filtering out all parts!")
+
+        variants = st.multiselect("What can vary?", options=[k for k in keys if k not in constants], format_func=format_dropdown)
             
-            submit = st.form_submit_button("Generate Comparison")
-            
-            if submit:
-                constants = [map_parameter_name(t, keys) for t in constants_input.split(",") if t.strip() and map_parameter_name(t, keys)]
-                variants = [map_parameter_name(t, keys) for t in variants_input.split(",") if t.strip() and map_parameter_name(t, keys)]
-                
-                with st.spinner("Scanning database & PDFs..."):
+        if st.button("Generate Comparison Spreadsheet"):
+            if not search_cat:
+                st.error("You must provide a search keyword!")
+            else:
+                with st.spinner("Scanning database and PDFs..."):
                     target_consts = {c: ref[c] for c in constants}
                     cands = find_similar_parts(token, search_cat, target_consts, variants)
                     
-                    if not cands:
+                    if cands is None:
+                        pass # Error already printed in the function
+                    elif not cands:
                         st.error("No matches found. Filters are too strict!")
                     else:
                         st.success(f"Found {len(cands)} matches!")
-                        st.session_state['excel_buffer'] = generate_advanced_excel_buffer(ref, cands, constants, variants)
-                        st.session_state['excel_filename'] = f"Comparison_{ref['Part Number']}.xlsx"
+                        buffer = generate_advanced_excel_buffer(ref, cands, constants, variants)
                         
-        # Place download button OUTSIDE the form!
-        if 'excel_buffer' in st.session_state:
-            st.download_button(
-                label="📥 Download Excel", 
-                data=st.session_state['excel_buffer'], 
-                file_name=st.session_state['excel_filename'],
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+                        safe_filename = "".join(c for c in ref['Part Number'] if c.isalnum() or c in "-_")
+                        st.download_button(
+                            label="Download Comparison Spreadsheet",
+                            data=buffer,
+                            file_name=f"Comparison_{safe_filename}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                        )
 
 # --- TAB 2: BATCH EXTRACT ---
 with tab2:
     st.markdown("Paste a list of part numbers (or PDF filenames) to extract all their characteristics into one master spreadsheet.")
     batch_input = st.text_area("Enter part numbers (comma-separated or one per line):", height=150)
     
-    if st.button("Extract Data", type="primary", key="batch_btn"):
+    if st.button("Extract Data", type="primary"):
         if batch_input:
             parts = [p.strip() for p in batch_input.replace('\n', ',').split(',') if p.strip()]
             
@@ -395,14 +477,19 @@ with tab2:
                         if prof:
                             extracted.append(prof)
                             for k in prof.keys():
-                                if k not in ["Part Number", "Manufacturer", "Description", "Price", "DatasheetUrl", "Category"]:
+                                if k not in ["Part Number", "Manufacturer", "Description", "Price", "DatasheetUrl", "ProductUrl", "Category"]:
                                     all_params.add(k)
-                    except Exception as e:
-                        st.warning(f"Could not process {clean}: {e}")
+                    except Exception:
+                        pass
                 
                 if extracted:
                     st.success(f"Successfully processed {len(extracted)} parts!")
                     buffer = generate_batch_extract_excel_buffer(extracted, sorted(list(all_params)))
-                    st.download_button("📥 Download Master Spreadsheet", data=buffer, file_name="Batch_Extraction.xlsx")
+                    st.download_button(
+                        label="Download Master Spreadsheet", 
+                        data=buffer, 
+                        file_name="Batch_Extraction.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
                 else:
-                    st.error("Failed to fetch any parts.")
+                    st.error("Failed to fetch any parts. Check your part numbers.")
