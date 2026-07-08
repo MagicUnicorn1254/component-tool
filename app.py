@@ -264,7 +264,7 @@ def generate_advanced_excel_buffer(ref_part, candidates, constants, variables):
         ws.cell(row=1, column=3+len(constants), value="Varying Aspects").alignment = center_align
         ws.merge_cells(start_row=1, start_column=3+len(constants), end_row=1, end_column=3+len(constants)+len(variables)-1)
     
-    ws.cell(row=1, column=price_col, value="Price 100-Qty (CAD)").alignment = center_align
+    ws.cell(row=1, column=price_col, value="Price 100-Qty (USD)").alignment = center_align
     ws.merge_cells(start_row=1, start_column=price_col, end_row=2, end_column=price_col)
 
     ws.cell(row=1, column=link_col, value="DigiKey Link").alignment = center_align
