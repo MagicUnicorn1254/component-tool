@@ -34,15 +34,14 @@ CORE_PDF_TARGETS = {
     "sound level": ["sound pressure level", "spl", "db"]
 }
 
-@st.cache_data(ttl=86400) # Caches the exchange rate for 24 hours
+@st.cache_data(ttl=86400) 
 def get_usd_to_cad_rate():
-    """Pings the live global exchange market for today's USD to CAD rate!"""
     try:
         url = "https://open.er-api.com/v6/latest/USD"
         response = requests.get(url, timeout=3)
         return float(response.json()['rates']['CAD'])
     except Exception:
-        return 1.36 # Safe fallback if the internet hiccups
+        return 1.36 
 
 def get_digikey_token():
     url = "https://api.digikey.com/v1/oauth2/token"
@@ -54,34 +53,47 @@ def get_digikey_token():
         return None
     return response.json()['access_token']
 
-def extract_price(prod_dict):
+def extract_prices(prod_dict):
+    """Pulls both the 1-Unit Price and 100-Unit Price"""
+    price_1 = 0.0
+    price_100 = 0.0
     try:
-        best_unit_price = float('inf')
         variations = prod_dict.get('ProductVariations', [])
         if not variations:
             variations = [{'StandardPricing': prod_dict.get('StandardPricing', [])}]
             
+        best_1 = float('inf')
+        best_100 = float('inf')
+        
         for var in variations:
             pricing_list = var.get('StandardPricing', [])
             if not pricing_list: continue
                 
             sorted_breaks = sorted(pricing_list, key=lambda x: x.get('BreakQuantity', 0))
-            if sorted_breaks[0].get('BreakQuantity', 0) > 100:
-                continue
-                
-            current_var_price = float('inf')
-            for price_break in sorted_breaks:
-                if price_break.get('BreakQuantity', 0) <= 100:
-                    current_var_price = price_break.get('UnitPrice', 0.0)
+            
+            for pb in sorted_breaks:
+                if pb.get('BreakQuantity', 0) == 1:
+                    if pb.get('UnitPrice', 0.0) < best_1:
+                        best_1 = pb.get('UnitPrice', 0.0)
+                        
+            if sorted_breaks[0].get('BreakQuantity', 0) <= 100:
+                current_var_100 = float('inf')
+                for pb in sorted_breaks:
+                    if pb.get('BreakQuantity', 0) <= 100:
+                        current_var_100 = pb.get('UnitPrice', 0.0)
+                if 0.0 < current_var_100 < best_100:
+                    best_100 = current_var_100
                     
-            if 0.0 < current_var_price < best_unit_price:
-                best_unit_price = current_var_price
-                
-        if best_unit_price != float('inf'):
-            return best_unit_price * 100 
+        if best_1 == float('inf'):
+            all_prices = [p.get('UnitPrice', 0.0) for v in variations for p in v.get('StandardPricing', [])]
+            if all_prices: best_1 = max(all_prices)
+            else: best_1 = 0.0
+            
+        if best_100 != float('inf'): price_100 = best_100 * 100
+            
+        return best_1, price_100
     except Exception: 
-        pass
-    return 0.0
+        return 0.0, 0.0
 
 def split_temperature_ranges(part_dict):
     for k, v in list(part_dict.items()):
@@ -139,7 +151,7 @@ def fetch_part_data(token, part_number):
         "Authorization": f"Bearer {token}", 
         "X-DIGIKEY-Client-Id": CLIENT_ID, 
         "Content-Type": "application/json",
-        "X-DIGIKEY-Locale-Site": "US", # Set to US to grab base prices
+        "X-DIGIKEY-Locale-Site": "US", 
         "X-DIGIKEY-Locale-Currency": "CAD"
     }
     
@@ -149,25 +161,19 @@ def fetch_part_data(token, part_number):
 
     products = response.json()['Products']
     prod = None
-
     for p in products:
         actual_part_number = p.get('ManufacturerProductNumber') or p.get('ProductCode') or ""
-        digikey_part_number = p.get('DigiKeyPartNumber') or ""
-        
-        # Check if the input matches EITHER the Manufacturer number OR the DigiKey number
-        if actual_part_number.lower().startswith(part_number.lower()) or digikey_part_number.lower().startswith(part_number.lower()):
+        # Accepts standard Part Number OR hidden DigiKey Barcodes
+        if actual_part_number.lower().startswith(part_number.lower()) or part_number.lower() in str(p).lower():
             prod = p
             break
             
     if not prod:
         raise Exception(f"Product '{part_number}' does not exist. Please check your part number.")
 
-    # --- THE SMART CURRENCY CONVERTER ---
-    raw_price = extract_price(prod)
+    raw_price_1, raw_price_100 = extract_prices(prod)
     is_usd = (headers.get("X-DIGIKEY-Locale-Site") == "US")
     cad_exchange_rate = get_usd_to_cad_rate() if is_usd else 1.0
-    final_cad_price = raw_price * cad_exchange_rate
-    # ------------------------------------
 
     datasheet_url = prod.get('DatasheetUrl')
 
@@ -175,7 +181,9 @@ def fetch_part_data(token, part_number):
         "Part Number": prod.get('ManufacturerProductNumber') or prod.get('ProductCode') or part_number,
         "Manufacturer": prod.get('Manufacturer', {}).get('Name'),
         "Description": prod.get('ProductDescription') or "",
-        "Price": final_cad_price,
+        "Stock": prod.get('QuantityAvailable', 0),
+        "Price1": raw_price_1 * cad_exchange_rate,
+        "Price100": raw_price_100 * cad_exchange_rate,
         "DatasheetUrl": datasheet_url,
         "ProductUrl": prod.get('ProductUrl', '').replace('.com', '.ca')
     }
@@ -192,13 +200,23 @@ def fetch_part_data(token, part_number):
     split_temperature_ranges(part_profile)
     return part_profile
 
+def map_parameter_name(user_term, available_keys):
+    user_term = user_term.lower().strip()
+    if user_term in available_keys: return user_term
+    for alias in SPEC_ALIASES.get(user_term, [user_term]):
+        for key in available_keys:
+            if alias in key: return key
+    for key in available_keys:
+        if user_term in key: return key
+    return None
+
 def find_similar_parts(token, search_keyword, constants_dict, variables_list):
     url = "https://api.digikey.com/products/v4/search/keyword"
     headers = {
         "Authorization": f"Bearer {token}", 
         "X-DIGIKEY-Client-Id": CLIENT_ID, 
         "Content-Type": "application/json",
-        "X-DIGIKEY-Locale-Site": "US", # Set to US to grab base prices
+        "X-DIGIKEY-Locale-Site": "US", 
         "X-DIGIKEY-Locale-Currency": "CAD"
     }
     response = requests.post(url, json={"Keywords": search_keyword, "Limit": 50}, headers=headers)
@@ -212,7 +230,6 @@ def find_similar_parts(token, search_keyword, constants_dict, variables_list):
         st.error(f"DigiKey returned 0 parts when searching for '{search_keyword}'. Check for typos!")
         return []
 
-    # Get the exchange rate once to save time
     is_usd = (headers.get("X-DIGIKEY-Locale-Site") == "US")
     cad_exchange_rate = get_usd_to_cad_rate() if is_usd else 1.0
 
@@ -258,14 +275,14 @@ def find_similar_parts(token, search_keyword, constants_dict, variables_list):
 
         if match_failed: continue
 
-        # --- APPLY THE SMART EXCHANGE RATE ---
-        raw_price = extract_price(prod)
-        final_cad_price = raw_price * cad_exchange_rate
+        raw_price_1, raw_price_100 = extract_prices(prod)
 
         matching_candidates.append({
             "Part Number": prod.get('ManufacturerProductNumber') or prod.get('ProductCode'),
             "Manufacturer": prod.get('Manufacturer', {}).get('Name'),
-            "Price": final_cad_price,
+            "Stock": prod.get('QuantityAvailable', 0),
+            "Price1": raw_price_1 * cad_exchange_rate,
+            "Price100": raw_price_100 * cad_exchange_rate,
             "DatasheetUrl": datasheet_url,
             "ProductUrl": prod.get('ProductUrl', '').replace('.com', '.ca'),
             "all_params": cand_params  
@@ -276,43 +293,56 @@ def generate_advanced_excel_buffer(ref_part, candidates, constants, variables):
     wb = Workbook()
     ws = wb.active
     center_align = Alignment(horizontal='center', vertical='center')
-    price_col = 3 + len(constants) + len(variables) 
-    link_col = price_col + 1
+    
+    start_params = 4
+    num_params = len(constants) + len(variables)
+    price1_col = start_params + num_params
+    price100_col = price1_col + 1
+    link_col = price100_col + 1
 
     ws.cell(row=1, column=1, value="Name / Part Number").alignment = center_align
     ws.merge_cells(start_row=1, start_column=1, end_row=2, end_column=1)
 
     ws.cell(row=1, column=2, value="Manufacturer").alignment = center_align
     ws.merge_cells(start_row=1, start_column=2, end_row=2, end_column=2)
+
+    ws.cell(row=1, column=3, value="In Stock").alignment = center_align
+    ws.merge_cells(start_row=1, start_column=3, end_row=2, end_column=3)
     
     if constants:
-        ws.cell(row=1, column=3, value="Constant Aspects").alignment = center_align
-        ws.merge_cells(start_row=1, start_column=3, end_row=1, end_column=3+len(constants)-1)
+        ws.cell(row=1, column=start_params, value="Constant Aspects").alignment = center_align
+        ws.merge_cells(start_row=1, start_column=start_params, end_row=1, end_column=start_params+len(constants)-1)
         
     if variables:
-        ws.cell(row=1, column=3+len(constants), value="Varying Aspects").alignment = center_align
-        ws.merge_cells(start_row=1, start_column=3+len(constants), end_row=1, end_column=3+len(constants)+len(variables)-1)
+        ws.cell(row=1, column=start_params+len(constants), value="Varying Aspects").alignment = center_align
+        ws.merge_cells(start_row=1, start_column=start_params+len(constants), end_row=1, end_column=start_params+num_params-1)
     
-    ws.cell(row=1, column=price_col, value="Price 100-Qty (CAD)").alignment = center_align
-    ws.merge_cells(start_row=1, start_column=price_col, end_row=2, end_column=price_col)
+    ws.cell(row=1, column=price1_col, value="Price 1-Qty (CAD)").alignment = center_align
+    ws.merge_cells(start_row=1, start_column=price1_col, end_row=2, end_column=price1_col)
+
+    ws.cell(row=1, column=price100_col, value="Price 100-Qty (CAD)").alignment = center_align
+    ws.merge_cells(start_row=1, start_column=price100_col, end_row=2, end_column=price100_col)
 
     ws.cell(row=1, column=link_col, value="DigiKey Link").alignment = center_align
     ws.merge_cells(start_row=1, start_column=link_col, end_row=2, end_column=link_col)
 
-    col = 3
+    col = start_params
     for c in constants + variables:
         ws.cell(row=2, column=col, value=str(c))
         col += 1
 
     ws.cell(row=3, column=1, value=f"ORIGINAL: {ref_part['Part Number']}")
     ws.cell(row=3, column=2, value=str(ref_part.get('Manufacturer', 'N/A')))
-    col = 3
+    ws.cell(row=3, column=3, value=ref_part.get('Stock', 0))
+    col = start_params
     for c in constants + variables:
         ws.cell(row=3, column=col, value=str(ref_part.get(c, 'N/A')))
         col += 1
     
-    ws.cell(row=3, column=price_col, value=round(float(ref_part.get('Price', 0.0)), 2))
-    ws.cell(row=3, column=price_col).number_format = '$0.00'
+    ws.cell(row=3, column=price1_col, value=round(float(ref_part.get('Price1', 0.0)), 2))
+    ws.cell(row=3, column=price1_col).number_format = '$0.00'
+    ws.cell(row=3, column=price100_col, value=round(float(ref_part.get('Price100', 0.0)), 2))
+    ws.cell(row=3, column=price100_col).number_format = '$0.00'
     
     url = ref_part.get('ProductUrl') or ref_part.get('DatasheetUrl')
     if url:
@@ -326,7 +356,8 @@ def generate_advanced_excel_buffer(ref_part, candidates, constants, variables):
     for cand in candidates:
         ws.cell(row=current_row, column=1, value=str(cand['Part Number']))
         ws.cell(row=current_row, column=2, value=str(cand.get('Manufacturer', 'N/A')))
-        col = 3
+        ws.cell(row=current_row, column=3, value=cand.get('Stock', 0))
+        col = start_params
         for c in constants + variables:
             val = cand['all_params'].get(c, 'N/A')
             ws.cell(row=current_row, column=col, value=str(val))
@@ -334,8 +365,10 @@ def generate_advanced_excel_buffer(ref_part, candidates, constants, variables):
                 ws.cell(row=current_row, column=col).font = Font(underline="single")
             col += 1
             
-        ws.cell(row=current_row, column=price_col, value=round(float(cand.get('Price', 0.0)), 2))
-        ws.cell(row=current_row, column=price_col).number_format = '$0.00'
+        ws.cell(row=current_row, column=price1_col, value=round(float(cand.get('Price1', 0.0)), 2))
+        ws.cell(row=current_row, column=price1_col).number_format = '$0.00'
+        ws.cell(row=current_row, column=price100_col, value=round(float(cand.get('Price100', 0.0)), 2))
+        ws.cell(row=current_row, column=price100_col).number_format = '$0.00'
 
         if cand.get('ProductUrl'):
             ws.cell(row=current_row, column=link_col, value="View on DigiKey")
@@ -348,8 +381,9 @@ def generate_advanced_excel_buffer(ref_part, candidates, constants, variables):
 
     ws.column_dimensions['A'].width = 30
     ws.column_dimensions['B'].width = 25
+    ws.column_dimensions['C'].width = 15
     ws.column_dimensions[ws.cell(row=3, column=link_col).column_letter].width = 18
-    for col_idx in range(3, price_col + 1):
+    for col_idx in range(start_params, price100_col + 1):
         ws.column_dimensions[ws.cell(row=3, column=col_idx).column_letter].width = 20
         
     buffer = io.BytesIO()
@@ -365,10 +399,12 @@ def generate_batch_extract_excel_buffer(part_profiles, all_params):
 
     ws.cell(row=1, column=1, value="Part Number").font = bold_font
     ws.cell(row=1, column=2, value="Manufacturer").font = bold_font
-    ws.cell(row=1, column=3, value="Price 100-Qty (CAD)").font = bold_font
-    ws.cell(row=1, column=4, value="DigiKey Link").font = bold_font
+    ws.cell(row=1, column=3, value="In Stock").font = bold_font
+    ws.cell(row=1, column=4, value="Price 1-Qty (CAD)").font = bold_font
+    ws.cell(row=1, column=5, value="Price 100-Qty (CAD)").font = bold_font
+    ws.cell(row=1, column=6, value="DigiKey Link").font = bold_font
     
-    col = 5
+    col = 7
     for param in all_params:
         ws.cell(row=1, column=col, value=str(param)).font = bold_font
         col += 1
@@ -377,17 +413,22 @@ def generate_batch_extract_excel_buffer(part_profiles, all_params):
     for profile in part_profiles:
         ws.cell(row=current_row, column=1, value=str(profile.get('Part Number', 'N/A')))
         ws.cell(row=current_row, column=2, value=str(profile.get('Manufacturer', 'N/A')))
-        ws.cell(row=current_row, column=3, value=round(float(profile.get('Price', 0.0)), 2))
-        ws.cell(row=current_row, column=3).number_format = '$0.00'
+        ws.cell(row=current_row, column=3, value=profile.get('Stock', 0))
+        
+        ws.cell(row=current_row, column=4, value=round(float(profile.get('Price1', 0.0)), 2))
+        ws.cell(row=current_row, column=4).number_format = '$0.00'
+        
+        ws.cell(row=current_row, column=5, value=round(float(profile.get('Price100', 0.0)), 2))
+        ws.cell(row=current_row, column=5).number_format = '$0.00'
 
         if profile.get('ProductUrl'):
-            ws.cell(row=current_row, column=4, value="View on DigiKey")
-            ws.cell(row=current_row, column=4).hyperlink = profile.get('ProductUrl')
-            ws.cell(row=current_row, column=4).font = Font(color="0000FF", underline="single")
+            ws.cell(row=current_row, column=6, value="View on DigiKey")
+            ws.cell(row=current_row, column=6).hyperlink = profile.get('ProductUrl')
+            ws.cell(row=current_row, column=6).font = Font(color="0000FF", underline="single")
         else:
-            ws.cell(row=current_row, column=4, value="N/A")
+            ws.cell(row=current_row, column=6, value="N/A")
 
-        col = 5
+        col = 7
         for param in all_params:
             ws.cell(row=current_row, column=col, value=str(profile.get(param, 'N/A')))
             col += 1
@@ -395,15 +436,18 @@ def generate_batch_extract_excel_buffer(part_profiles, all_params):
 
     ws.column_dimensions['A'].width = 25
     ws.column_dimensions['B'].width = 20
-    ws.column_dimensions['C'].width = 20
+    ws.column_dimensions['C'].width = 15
     ws.column_dimensions['D'].width = 20
-    for col_idx in range(5, 5 + len(all_params)):
+    ws.column_dimensions['E'].width = 20
+    ws.column_dimensions['F'].width = 20
+    for col_idx in range(7, 7 + len(all_params)):
         ws.column_dimensions[ws.cell(row=1, column=col_idx).column_letter].width = 20
 
     buffer = io.BytesIO()
     wb.save(buffer)
     buffer.seek(0)
     return buffer
+
 
 # ==========================================
 # STREAMLIT UI
@@ -437,9 +481,9 @@ with tab1:
                     
     if 'ref_profile' in st.session_state:
         ref = st.session_state['ref_profile']
-        st.success(f"Loaded: {ref['Part Number']} ({ref['Manufacturer']}) - ${round(float(ref['Price']), 2)} CAD")
+        st.success(f"Loaded: {ref['Part Number']} ({ref['Manufacturer']}) - {ref['Stock']} In Stock")
         
-        keys = [k for k in ref.keys() if k not in ["Part Number", "Manufacturer", "Description", "Price", "DatasheetUrl", "ProductUrl", "Category"]]
+        keys = [k for k in ref.keys() if k not in ["Part Number", "Manufacturer", "Description", "Price1", "Price100", "Stock", "DatasheetUrl", "ProductUrl", "Category"]]
         
         def format_dropdown(key_name):
             return f"{key_name}: {ref.get(key_name, 'N/A')}"
@@ -504,7 +548,7 @@ with tab2:
                         if prof:
                             extracted.append(prof)
                             for k in prof.keys():
-                                if k not in ["Part Number", "Manufacturer", "Description", "Price", "DatasheetUrl", "ProductUrl", "Category"]:
+                                if k not in ["Part Number", "Manufacturer", "Description", "Price1", "Price100", "Stock", "DatasheetUrl", "ProductUrl", "Category"]:
                                     all_params.add(k)
                     except Exception:
                         pass
