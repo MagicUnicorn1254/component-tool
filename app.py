@@ -149,9 +149,13 @@ def fetch_part_data(token, part_number):
 
     products = response.json()['Products']
     prod = None
+
     for p in products:
         actual_part_number = p.get('ManufacturerProductNumber') or p.get('ProductCode') or ""
-        if actual_part_number.lower().startswith(part_number.lower()):
+        digikey_part_number = p.get('DigiKeyPartNumber') or ""
+        
+        # Check if the input matches EITHER the Manufacturer number OR the DigiKey number
+        if actual_part_number.lower().startswith(part_number.lower()) or digikey_part_number.lower().startswith(part_number.lower()):
             prod = p
             break
             
