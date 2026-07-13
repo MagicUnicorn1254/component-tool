@@ -491,7 +491,7 @@ with tab1:
         desc = str(ref.get("Description", ""))
         smart_sugg = " ".join(desc.split()[:2]) if desc else ""
         
-        search_cat = st.text_input("Search Keyword (DigiKey shorthand):", value=smart_sugg)
+        search_cat = st.text_input("Search Keyword:", value=smart_sugg)
         
         constants = st.multiselect("What MUST remain exactly the same?", options=keys, format_func=format_dropdown)
         
